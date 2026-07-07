@@ -135,6 +135,34 @@ def get_records(sheet_name):
         return []
 
 
+def check_duplicate_payment(resident_name, year, pay_months):
+    """檢查是否有重複收款紀錄"""
+    records = get_records("收款紀錄")
+    duplicates = []
+    pay_months_set = set(pay_months)
+    for r in records:
+        if r.get('住戶姓名', '') != resident_name:
+            continue
+        if int(r.get('收款年份', 0)) != year:
+            continue
+        existing_months = set()
+        for m in str(r.get('繳費月份', '')).split(','):
+            m = m.strip()
+            if m.isdigit():
+                existing_months.add(int(m))
+        overlap = pay_months_set & existing_months
+        if overlap:
+            duplicates.append({
+                '日期': r.get('日期', ''),
+                '繳費類型': r.get('繳費類型', ''),
+                '繳費月份': r.get('繳費月份', ''),
+                '金額': r.get('金額', 0),
+                '備註': r.get('備註', ''),
+                '重複月份': sorted(overlap),
+            })
+    return duplicates
+
+
 def append_record(sheet_name, row_data):
     """新增一筆紀錄到指定工作表"""
     try:
@@ -258,6 +286,50 @@ if page == "💰 收款登記":
     # 備註
     note = st.text_area("備註", placeholder="（選填）", height=80)
 
+    # --- 重複檢查 session state 初始化 ---
+    if 'duplicate_check_done' not in st.session_state:
+        st.session_state.duplicate_check_done = False
+    if 'duplicates_found' not in st.session_state:
+        st.session_state.duplicates_found = []
+    if 'pending_record' not in st.session_state:
+        st.session_state.pending_record = None
+
+    def do_submit(record_info, photo_bytes):
+        """實際執行送出"""
+        with st.spinner("送出中..."):
+            photo_link = ""
+            if photo_bytes:
+                compressed = compress_image(photo_bytes)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{record_info['地址']}_{record_info['姓名']}_{ts}.jpg"
+                photo_link = upload_photo_to_drive(compressed, filename)
+
+            record_id = generate_id()
+            row = [
+                record_id,
+                record_info['日期'],
+                record_info['編號'],
+                record_info['姓名'],
+                record_info['地址'],
+                record_info['收款年份'],
+                record_info['收款月份'],
+                record_info['繳費類型'],
+                record_info['繳費月份'],
+                record_info['金額'],
+                record_info['備註'],
+                photo_link,
+                ""  # 已匯入欄位留空
+            ]
+            if append_record("收款紀錄", row):
+                st.success(f"✅ 已登記！{record_info['地址']} {record_info['姓名']} ${record_info['金額']:,}")
+                st.balloons()
+                # 清除重複檢查狀態
+                st.session_state.duplicate_check_done = False
+                st.session_state.duplicates_found = []
+                st.session_state.pending_record = None
+            else:
+                st.error("寫入失敗，請重試。")
+
     # 送出
     st.divider()
     if st.button("✅ 確認送出", type="primary", use_container_width=True):
@@ -266,38 +338,68 @@ if page == "💰 收款登記":
         elif amount <= 0:
             st.error("金額必須大於 0！")
         else:
-            with st.spinner("送出中..."):
-                # 上傳照片到 Drive
-                photo_link = ""
-                if photo_data:
-                    compressed = compress_image(photo_data)
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"{selected_resident['地址']}_{selected_resident['姓名']}_{ts}.jpg"
-                    photo_link = upload_photo_to_drive(compressed, filename)
+            # 組裝待送出紀錄
+            pay_months_str = ",".join([str(m) for m in pay_months])
+            pending = {
+                '日期': today.strftime("%Y-%m-%d"),
+                '編號': int(selected_resident['編號']),
+                '姓名': selected_resident['姓名'],
+                '地址': selected_resident['地址'],
+                '收款年份': int(collect_year),
+                '收款月份': int(collect_month),
+                '繳費類型': pay_type,
+                '繳費月份': pay_months_str,
+                '金額': int(amount),
+                '備註': note,
+            }
 
-                # 寫入收款紀錄
-                record_id = generate_id()
-                pay_months_str = ",".join([str(m) for m in pay_months])
-                row = [
-                    record_id,
-                    today.strftime("%Y-%m-%d"),
-                    int(selected_resident['編號']),
-                    selected_resident['姓名'],
-                    selected_resident['地址'],
-                    int(collect_year),
-                    int(collect_month),
-                    pay_type,
-                    pay_months_str,
-                    int(amount),
-                    note,
-                    photo_link,
-                    ""  # 已匯入欄位留空
-                ]
-                if append_record("收款紀錄", row):
-                    st.success(f"✅ 已登記！{selected_resident['地址']} {selected_resident['姓名']} ${amount:,}")
-                    st.balloons()
-                else:
-                    st.error("寫入失敗，請重試。")
+            # 檢查重複
+            duplicates = check_duplicate_payment(
+                selected_resident['姓名'], int(collect_year), pay_months
+            )
+
+            if not duplicates:
+                # 無重複，直接送出
+                do_submit(pending, photo_data)
+            else:
+                # 有重複，暫存並顯示警告
+                st.session_state.duplicate_check_done = True
+                st.session_state.duplicates_found = duplicates
+                st.session_state.pending_record = pending
+                st.session_state.pending_photo = photo_data
+                st.rerun()
+
+    # --- 顯示重複警告 ---
+    if st.session_state.duplicate_check_done and st.session_state.duplicates_found:
+        st.warning("⚠️ 此住戶本月已有收款紀錄！")
+        for dup in st.session_state.duplicates_found:
+            overlap_str = "、".join([f"{m}月" for m in dup['重複月份']])
+            note_display = dup['備註'] if dup['備註'] else "（無）"
+            st.markdown(
+                f"**既有紀錄：**\n\n"
+                f"📅 {dup['日期']} | {dup['繳費類型']} | {overlap_str} | ${int(dup['金額']):,}\n\n"
+                f"　備註：{note_display}"
+            )
+        st.markdown("請確認是否重複收款，避免收錯帳。")
+
+        col_cancel, col_force = st.columns(2)
+        with col_cancel:
+            if st.button("❌ 取消", use_container_width=True):
+                st.session_state.duplicate_check_done = False
+                st.session_state.duplicates_found = []
+                st.session_state.pending_record = None
+                st.session_state.pending_photo = None
+                st.rerun()
+        with col_force:
+            if st.button("⚠️ 確認不是重複，仍要送出", use_container_width=True):
+                do_submit(
+                    st.session_state.pending_record,
+                    st.session_state.get('pending_photo')
+                )
+                st.session_state.duplicate_check_done = False
+                st.session_state.duplicates_found = []
+                st.session_state.pending_record = None
+                st.session_state.pending_photo = None
 
 # ==========================================
 # 🧾 代墊支出
