@@ -7,6 +7,7 @@ from googleapiclient.http import MediaInMemoryUpload
 from datetime import datetime, date
 from io import BytesIO
 from PIL import Image
+import re
 import time
 
 # --- 頁面設定（手機友善）---
@@ -135,6 +136,40 @@ def get_records(sheet_name):
         return []
 
 
+def parse_pay_months(value):
+    """把「繳費月份」欄位轉成月份清單。
+
+    新格式用頓號「7、8、9」(逗號會被 Google 試算表當千分位)。
+    也相容舊格式「7,8,9」,以及已經被試算表黏成一個數字的舊資料:
+    1112 → [11, 12]、789101112 → [7, 8, 9, 10, 11, 12]。
+    """
+    s = str(value).strip()
+    parts = [p.strip() for p in re.split(r"[,、，]", s) if p.strip()]
+    if len(parts) > 1:
+        return [int(p) for p in parts if p.isdigit()]
+    if not s.isdigit():
+        return []
+    v = int(s)
+    if 1 <= v <= 12:
+        return [v]
+    # 舊資料:連續月份被黏成一個數字,找出從哪個月開始接起來剛好等於它
+    for start in range(1, 13):
+        seq, m, joined = [], start, ""
+        while len(joined) < len(s):
+            joined += str(m)
+            seq.append(m)
+            m = m % 12 + 1
+        if joined == s:
+            return seq
+    return []
+
+
+def format_pay_months(value):
+    """繳費月份顯示用,例如 1112 → 「11、12」"""
+    months = parse_pay_months(value)
+    return "、".join(str(m) for m in months) if months else str(value)
+
+
 def check_duplicate_payment(resident_name, year, pay_months):
     """檢查是否有重複收款紀錄"""
     records = get_records("收款紀錄")
@@ -145,11 +180,7 @@ def check_duplicate_payment(resident_name, year, pay_months):
             continue
         if int(r.get('收款年份', 0)) != year:
             continue
-        existing_months = set()
-        for m in str(r.get('繳費月份', '')).split(','):
-            m = m.strip()
-            if m.isdigit():
-                existing_months.add(int(m))
+        existing_months = set(parse_pay_months(r.get('繳費月份', '')))
         overlap = pay_months_set & existing_months
         if overlap:
             duplicates.append({
@@ -254,14 +285,14 @@ if page == "💰 收款登記":
     elif pay_type == "預繳下月":
         next_month = collect_month + 1 if collect_month < 12 else 1
         next_year = collect_year if collect_month < 12 else collect_year + 1
-        # 可選擇預繳幾個月
-        prepay_count = st.number_input("預繳月數", value=1, min_value=1, max_value=6, step=1)
-        pay_months = []
-        for i in range(prepay_count):
-            m = collect_month + 1 + i
-            if m > 12:
-                m -= 12
-            pay_months.append(m)
+        # 可選擇從幾月開始、預繳幾個月(收款月份維持實際收錢的月份,不用往前調)
+        col_start, col_count = st.columns(2)
+        with col_start:
+            prepay_start = st.number_input("從幾月開始", value=next_month,
+                                           min_value=1, max_value=12, step=1)
+        with col_count:
+            prepay_count = st.number_input("預繳月數", value=1, min_value=1, max_value=12, step=1)
+        pay_months = [((prepay_start - 1 + i) % 12) + 1 for i in range(prepay_count)]
         months_str = "、".join([f"{m}月" for m in pay_months])
         st.write(f"預繳月份：**{months_str}**")
 
@@ -339,7 +370,8 @@ if page == "💰 收款登記":
             st.error("金額必須大於 0！")
         else:
             # 組裝待送出紀錄
-            pay_months_str = ",".join([str(m) for m in pay_months])
+            # 用頓號分隔:逗號會被 Google 試算表當千分位,"11,12" 會變成 1112
+            pay_months_str = "、".join([str(m) for m in pay_months])
             pending = {
                 '日期': today.strftime("%Y-%m-%d"),
                 '編號': int(selected_resident['編號']),
@@ -524,7 +556,7 @@ elif page == "📊 本月對帳報告":
             total_late = sum(int(r.get('金額', 0)) for r in late_payments)
             st.markdown(f"**{len(late_payments)} 戶　${total_late:,}**")
             for r in late_payments:
-                months_str = r.get('繳費月份', '')
+                months_str = format_pay_months(r.get('繳費月份', ''))
                 st.markdown(
                     f"- {r.get('地址', '')} {r.get('住戶姓名', '')}　"
                     f"${int(r.get('金額', 0)):,}（{months_str}月）"
@@ -538,7 +570,7 @@ elif page == "📊 本月對帳報告":
             total_prepaid = sum(int(r.get('金額', 0)) for r in prepaid_payments)
             st.markdown(f"**{len(prepaid_payments)} 戶　${total_prepaid:,}**")
             for r in prepaid_payments:
-                months_str = r.get('繳費月份', '')
+                months_str = format_pay_months(r.get('繳費月份', ''))
                 st.markdown(
                     f"- {r.get('地址', '')} {r.get('住戶姓名', '')}　"
                     f"${int(r.get('金額', 0)):,}（{months_str}月）"
@@ -600,7 +632,7 @@ elif page == "📋 收款紀錄查詢":
                     f"{r.get('日期', '')} | {r.get('地址', '')} {r.get('住戶姓名', '')} "
                     f"| {r.get('繳費類型', '')} | ${int(r.get('金額', 0)):,}"
                 ):
-                    st.write(f"**繳費月份：** {r.get('繳費月份', '')}月")
+                    st.write(f"**繳費月份：** {format_pay_months(r.get('繳費月份', ''))}月")
                     if r.get('備註'):
                         st.write(f"**備註：** {r['備註']}")
                     if r.get('照片連結'):
